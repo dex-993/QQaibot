@@ -1,0 +1,500 @@
+"""根据 llm_config.ini 调用 OpenClaw（OpenResponses）或本地 OpenAI 兼容接口；支持多轮上下文。"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+import httpx
+from openai import APIStatusError, APITimeoutError, AsyncOpenAI, OpenAIError
+
+import openclaw_memory
+
+from .chat_history import ChatScope, HistorySession, history_key
+from .llm_ini import get_backend, get_history_config, model_supports_vision, section_dict
+from .reply_error_echo_guard import assistant_text_looks_like_api_error_echo
+
+logger = logging.getLogger(__name__)
+
+# 仅发图、无附言时占位；勿引导模型「默认描述画面」，以免压过 soul/agent 里的聊天人设
+_DEFAULT_VISION_USER_TEXT = (
+    "（本条只有图片、没有文字）请按 system 里的人设像平常一样自然接话；"
+    "需要时可带过图里的信息，不要默认写一篇「图片里有什么」的说明文。"
+)
+_VISION_SYSTEM_SUFFIX = (
+    "\n\n【多模态】用户消息里可能含图片：请始终沿用你的人设与语气来回复；"
+    "结合对方的文字（若有）和图片来答。除非对方明确要求你描述、讲解或辨认画面内容，"
+    "否则以对话接续为主，不要把整段回复写成纯画面说明。"
+)
+
+
+def _openai_compatible_error_detail(body: object | None) -> str:
+    """从 OpenAI 兼容错误 JSON 中取出简短说明（便于排查 400）。"""
+    if body is None:
+        return ""
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"]).strip()[:500]
+        if isinstance(err, str) and err.strip():
+            return err.strip()[:500]
+        if body.get("message"):
+            return str(body["message"]).strip()[:500]
+    if isinstance(body, str) and body.strip():
+        return body.strip()[:500]
+    return ""
+
+
+def _extract_openresponses_text(data: Any) -> str:
+    """从 OpenResponses JSON 中尽量取出助手文本。"""
+    if not isinstance(data, dict):
+        return ""
+    err = data.get("error")
+    if isinstance(err, dict) and err.get("message"):
+        return f"（OpenClaw：{err['message']}）"
+
+    out = data.get("output")
+    if isinstance(out, list):
+        parts: list[str] = []
+        for item in out:
+            if not isinstance(item, dict):
+                continue
+            for c in item.get("content") or []:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "output_text" and c.get("text"):
+                    parts.append(str(c["text"]))
+                elif c.get("text"):
+                    parts.append(str(c["text"]))
+        if parts:
+            return "\n".join(parts).strip()
+
+    def walk(o: Any, depth: int = 0) -> str | None:
+        if depth > 25:
+            return None
+        if isinstance(o, dict):
+            if o.get("type") == "output_text" and o.get("text"):
+                return str(o["text"])
+            for v in o.values():
+                r = walk(v, depth + 1)
+                if r:
+                    return r
+        elif isinstance(o, list):
+            for x in o:
+                r = walk(x, depth + 1)
+                if r:
+                    return r
+        return None
+
+    found = walk(data.get("output"))
+    if found:
+        return found.strip()
+    return ""
+
+
+def _normalize_openclaw_model_field(raw: str) -> str:
+    """OpenResponses 要求 model 为 `openclaw` 或 `openclaw/<agentId>`（斜杠），禁止 openclaw:xxx。"""
+    m = raw.strip()
+    if not m:
+        return "openclaw"
+    if m == "openclaw":
+        return m
+    if m.startswith("openclaw:"):
+        rest = m[len("openclaw:") :].strip().lstrip("/")
+        return f"openclaw/{rest}" if rest else "openclaw"
+    if m.startswith("openclaw/"):
+        return m
+    return m
+
+
+def _openclaw_resolve_agent(oc: dict[str, str]) -> tuple[str, str] | None:
+    sub = (oc.get("subagent_id") or "").strip()
+    aid = (oc.get("agent_id") or "").strip()
+    if sub:
+        effective = sub
+    elif aid:
+        effective = aid
+    else:
+        return None
+
+    model = _normalize_openclaw_model_field(oc.get("model") or "")
+    return effective, model
+
+
+def _openclaw_session_user(
+    chat_scope: ChatScope,
+    user_id: str,
+    group_id: str | None,
+) -> str:
+    if chat_scope == "private":
+        return f"qq:priv:{user_id}"
+    if group_id is not None:
+        return f"qq:grp:{group_id}:u{user_id}"
+    return f"qq:{user_id}"
+
+
+def _normalize_openclaw_base_url(url: str) -> str:
+    """OpenClaw 只填 Gateway 根地址；自动去掉误粘贴的 /v1/responses、/v1 等后缀。"""
+    u = url.strip().rstrip("/")
+    for suffix in ("/v1/responses", "/v1/chat/completions"):
+        if u.lower().endswith(suffix):
+            u = u[: -len(suffix)].rstrip("/")
+    if u.lower().endswith("/v1"):
+        u = u[:-3].rstrip("/")
+    return u
+
+
+def _normalize_openai_base_url(url: str) -> str:
+    u = url.strip().rstrip("/")
+    if not u.endswith("/v1"):
+        u = f"{u}/v1"
+    return u
+
+
+def _build_multimodal_user_content(
+    user_text: str,
+    image_data_uris: list[str],
+) -> list[dict[str, Any]]:
+    """先文后图：与 LM Studio 文档里 `add_user_message(text, images=...)` 一致。
+
+    Qwen 系在 LM Studio 里用 Jinja 拼 prompt 时，常把**首段** user text 当 query；
+    「图在前、文在后」会导致首轮就报 *No user query found*（与是否多轮无关）。
+    """
+    t = user_text.strip()
+    query = t if t else _DEFAULT_VISION_USER_TEXT
+    parts: list[dict[str, Any]] = [{"type": "text", "text": query}]
+    for uri in image_data_uris:
+        parts.append({"type": "image_url", "image_url": {"url": uri}})
+    return parts
+
+
+def _text_parts_from_multimodal(content: list[Any]) -> str:
+    """从多模态 user content 里只取 text 段（用于历史里去掉旧图）。"""
+    texts: list[str] = []
+    for x in content:
+        if isinstance(x, dict) and x.get("type") == "text":
+            texts.append(str(x.get("text", "")))
+    return "\n".join(texts).strip()
+
+
+def collapse_old_vision_in_history(hist: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """LM Studio / Jinja 对「多轮里多条带图 user」支持差，且重复塞 data: 图会巨大。
+
+    只保留**最后一条** user 的多模态；更早的带图 user 压成纯文字（保留当时的文字说明）。
+    """
+    last_user_i = -1
+    for i in range(len(hist) - 1, -1, -1):
+        if hist[i].get("role") == "user":
+            last_user_i = i
+            break
+    if last_user_i < 0:
+        return [dict(m) for m in hist]
+    out: list[dict[str, Any]] = []
+    for i, m in enumerate(hist):
+        row = dict(m)
+        c = row.get("content")
+        if row.get("role") == "user" and isinstance(c, list) and i != last_user_i:
+            t = _text_parts_from_multimodal(c)
+            row["content"] = t if t else "[用户发送过一张图片]"
+        out.append(row)
+    return out
+
+
+async def _call_local(
+    messages: list[dict[str, Any]],
+) -> tuple[bool, str]:
+    loc = section_dict("local")
+    base_url = _normalize_openai_base_url(
+        (loc.get("base_url") or "http://127.0.0.1:11434/v1").strip(),
+    )
+    api_key = (loc.get("api_key") or "ollama").strip()
+    model = (loc.get("model") or "qwen2.5:latest").strip()
+    timeout = float(loc.get("timeout_seconds") or "120")
+
+    client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.7,
+        )
+        choice = resp.choices[0].message
+        out = (choice.content or "").strip()
+        if not out:
+            logger.warning("Local LLM returned empty content")
+            return False, ""
+        if assistant_text_looks_like_api_error_echo(out):
+            logger.warning(
+                "Local LLM reply looks like API/HTTP error echo (suppressed): %s",
+                out[:500],
+            )
+            return False, ""
+        return True, out
+    except APITimeoutError:
+        logger.warning("Local LLM request timeout")
+        return False, ""
+    except APIStatusError as e:
+        detail = _openai_compatible_error_detail(e.body)
+        logger.warning(
+            "Local LLM HTTP %s: %s (%s)",
+            e.status_code,
+            e.body,
+            detail or "no detail",
+        )
+        return False, ""
+    except OpenAIError as e:
+        logger.warning("Local LLM OpenAI error: %s", e)
+        return False, ""
+    except Exception:
+        logger.exception("Local LLM unexpected error")
+        return False, ""
+
+
+def _openclaw_http_error_message(status_code: int, detail: Any) -> str:
+    """把网关返回体压缩成用户可读短句，502 附带常见原因提示。"""
+    extra = ""
+    if isinstance(detail, dict):
+        err = detail.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            extra = str(err["message"]).strip()[:300]
+        elif isinstance(err, str):
+            extra = err.strip()[:300]
+        elif detail.get("message"):
+            extra = str(detail["message"]).strip()[:300]
+    elif isinstance(detail, str) and detail.strip():
+        extra = detail.strip()[:300]
+
+    hint_502 = (
+        " 常见原因：① 网关后「上游模型/API」不可用或未配置；② 未在 OpenClaw 中启用 "
+        "`gateway.http.endpoints.responses`；③ 智能体绑定的提供商密钥/网络异常。"
+    )
+    hint = hint_502 if status_code == 502 else ""
+
+    if extra:
+        return f"（OpenClaw HTTP {status_code}：{extra}）{hint}".strip()
+    return f"（OpenClaw HTTP {status_code}）{hint}".strip()
+
+
+async def _call_openclaw(
+    *,
+    chat_scope: ChatScope,
+    user_id: str,
+    group_id: str | None,
+    input_payload: str | list[Any],
+    oc: dict[str, str],
+    agent_id: str,
+    model: str,
+    instructions: str,
+    timeout: float,
+) -> tuple[bool, str]:
+    base = _normalize_openclaw_base_url(oc.get("base_url") or "")
+    token = (oc.get("token") or "").strip()
+    if not base:
+        logger.error("OpenClaw: base_url is empty")
+        return False, ""
+    url = f"{base}/v1/responses"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "x-openclaw-agent-id": agent_id,
+    }
+    body: dict[str, Any] = {
+        "model": model,
+        "input": input_payload,
+        "stream": False,
+        "user": _openclaw_session_user(chat_scope, user_id, group_id),
+    }
+    if instructions:
+        body["instructions"] = instructions
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(url, headers=headers, json=body)
+            if r.status_code >= 400:
+                try:
+                    detail = r.json()
+                except json.JSONDecodeError:
+                    detail = r.text[:800]
+                logger.warning(
+                    "OpenClaw HTTP %s: %s | user_message=%s",
+                    r.status_code,
+                    detail,
+                    _openclaw_http_error_message(r.status_code, detail),
+                )
+                return False, ""
+            data = r.json()
+    except httpx.TimeoutException:
+        logger.warning("OpenClaw request timeout")
+        return False, ""
+    except Exception as e:
+        logger.exception("OpenClaw request error: %s", e)
+        return False, ""
+
+    text = _extract_openresponses_text(data)
+    if text.startswith("（OpenClaw："):
+        logger.warning("OpenClaw response error text: %s", text)
+        return False, ""
+    if not text:
+        logger.warning("OpenClaw: no assistant text in response body")
+        return False, ""
+    if assistant_text_looks_like_api_error_echo(text):
+        logger.warning(
+            "OpenClaw reply looks like API/HTTP error echo (suppressed): %s",
+            text[:500],
+        )
+        return False, ""
+    return True, text
+
+
+def _openclaw_flatten_user_content(content: object) -> str:
+    """OpenClaw 仅走文本：多模态 user 只取 text 段。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts: list[str] = []
+        for x in content:
+            if isinstance(x, dict) and x.get("type") == "text":
+                texts.append(str(x.get("text", "")))
+        return "\n".join(texts) or "（本条含图片，OpenClaw 路径暂不按图理解）"
+    return ""
+
+
+def _openclaw_input_from_history(
+    hist: list[dict[str, Any]],
+) -> str | list[dict[str, Any]]:
+    if len(hist) == 1 and hist[0].get("role") == "user":
+        return _openclaw_flatten_user_content(hist[0].get("content"))
+    items: list[dict[str, Any]] = []
+    for m in hist:
+        role = m.get("role", "user")
+        raw = m.get("content", "")
+        if role == "user":
+            content = _openclaw_flatten_user_content(raw)
+        else:
+            content = raw if isinstance(raw, str) else _openclaw_flatten_user_content(raw)
+        if role not in ("user", "assistant", "system"):
+            role = "user"
+        items.append({"type": "message", "role": role, "content": content})
+    return items
+
+
+async def reply_with_configured_llm(
+    user_text: str,
+    user_id: str,
+    *,
+    chat_scope: ChatScope = "private",
+    group_id: str | None = None,
+    image_data_uris: list[str] | None = None,
+) -> str:
+    """按 backend 路由；可选多轮（内存）。本地 + supports_vision 时可传图。"""
+    cfg_hist = get_history_config()
+    key = (
+        history_key(chat_scope, user_id, group_id) if cfg_hist["enable"] else None
+    )
+
+    uris = [u for u in (image_data_uris or []) if u]
+    backend = get_backend()
+    vision = model_supports_vision()
+    use_local_vision = bool(
+        backend == "local" and vision and uris,
+    )
+    async with HistorySession(key) as hs:
+        if hs.active:
+            if use_local_vision:
+                mm = _build_multimodal_user_content(user_text, uris)
+                hs.append_user_multimodal(mm)
+            else:
+                hs.append_user(user_text)
+            hist = hs.snapshot_for_api()
+        else:
+            if use_local_vision:
+                hist = [
+                    {
+                        "role": "user",
+                        "content": _build_multimodal_user_content(user_text, uris),
+                    },
+                ]
+            else:
+                hist = [{"role": "user", "content": user_text}]
+
+        if backend == "openclaw":
+            oc = section_dict("openclaw")
+            base = _normalize_openclaw_base_url(oc.get("base_url") or "")
+            token = (oc.get("token") or "").strip()
+            if not base:
+                logger.error(
+                    "OpenClaw: base_url not configured (user_id=%s scope=%s)",
+                    user_id,
+                    chat_scope,
+                )
+                if hs.active:
+                    hs.rollback_user()
+                return ""
+            if not token or token == "YOUR_OPENCLAW_GATEWAY_TOKEN":
+                logger.error(
+                    "OpenClaw: missing or placeholder token (user_id=%s)",
+                    user_id,
+                )
+                if hs.active:
+                    hs.rollback_user()
+                return ""
+
+            resolved = _openclaw_resolve_agent(oc)
+            if resolved is None:
+                logger.error(
+                    "OpenClaw: subagent_id and agent_id both missing (user_id=%s)",
+                    user_id,
+                )
+                if hs.active:
+                    hs.rollback_user()
+                return ""
+
+            agent_id, model = resolved
+            instructions = (oc.get("instructions") or "").strip()
+            timeout = float(oc.get("timeout_seconds") or "120")
+            input_payload = _openclaw_input_from_history(hist)
+
+            ok, reply = await _call_openclaw(
+                chat_scope=chat_scope,
+                user_id=user_id,
+                group_id=group_id,
+                input_payload=input_payload,
+                oc=oc,
+                agent_id=agent_id,
+                model=model,
+                instructions=instructions,
+                timeout=timeout,
+            )
+        else:
+            loc = section_dict("local")
+            base_system = (loc.get("system_prompt") or "你是一个友好的聊天助手。").strip()
+            system = base_system
+            ocw = openclaw_memory.get_workspace_bundle()
+            if ocw:
+                system = (
+                    f"{system}\n\n---\n【工作区记忆（soul.md / agent.md，已排除 USER.md）】\n"
+                    f"{ocw}"
+                )
+            if use_local_vision:
+                system = system + _VISION_SYSTEM_SUFFIX
+            hist_local = collapse_old_vision_in_history(hist)
+            messages: list[dict[str, Any]] = (
+                [{"role": "system", "content": system}] + hist_local
+            )
+            ok, reply = await _call_local(messages)
+
+        text_out = (reply or "").strip() if ok else ""
+        if hs.active:
+            if text_out:
+                hs.append_assistant(text_out)
+            else:
+                if ok:
+                    logger.warning(
+                        "LLM returned empty reply after success (user_id=%s scope=%s)",
+                        user_id,
+                        chat_scope,
+                    )
+                hs.rollback_user()
+
+        return text_out
