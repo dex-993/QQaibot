@@ -4,3 +4,7 @@ venv/
 __pycache__/
 *.py[cod]
 *.egg-info/
+
+# 本地私密配置（示例见 *.example.ini）
+llm_config.ini
+group_whitelist.ini

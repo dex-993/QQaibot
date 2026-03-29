@@ -44,7 +44,11 @@ pip install -e .
 
 ```bash
 copy .env.example .env
+copy llm_config.example.ini llm_config.ini
+copy group_whitelist.example.ini group_whitelist.ini
 ```
+
+（`llm_config.ini`、`group_whitelist.ini` 含密钥与个人 QQ/群号，默认已加入 `.gitignore`；仓库内只保留对应的 `*.example.ini` 模板。）
 
 ---
 

@@ -4,6 +4,7 @@
 
 ## 配置
 
+- **首次克隆**：复制 `llm_config.example.ini` → `llm_config.ini`，`group_whitelist.example.ini` → `group_whitelist.ini`，再按需填写；勿将含真实 token / QQ / 群号的上述 INI 提交到 Git（已由 `.gitignore` 忽略）。
 - 默认在 [`.env`](.env) 中连接 `ws://127.0.0.1:18881`（与 NapCat 面板中的 OneBot 11 **正向 WebSocket** 监听地址一致）。
 - 若 NapCat 要求路径（例如自定义 `ws` 路径），请把 `ONEBOT_WS_URLS` 改成完整地址，如 `["ws://127.0.0.1:18881/xxx"]`。
 - 驱动为 `~fastapi+~websockets`，以支持 WebSocket **客户端**连接。
