@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import shlex
 from typing import Any
 
 import httpx
@@ -288,63 +290,79 @@ async def _call_openclaw(
     instructions: str,
     timeout: float,
 ) -> tuple[bool, str]:
-    base = _normalize_openclaw_base_url(oc.get("base_url") or "")
-    token = (oc.get("token") or "").strip()
-    if not base:
-        logger.error("OpenClaw: base_url is empty")
-        return False, ""
-    url = f"{base}/v1/responses"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "x-openclaw-agent-id": agent_id,
-    }
-    body: dict[str, Any] = {
-        "model": model,
-        "input": input_payload,
-        "stream": False,
-        "user": _openclaw_session_user(chat_scope, user_id, group_id),
-    }
-    if instructions:
-        body["instructions"] = instructions
+    session_id = _openclaw_session_user(chat_scope, user_id, group_id)
+    
+    if isinstance(input_payload, str):
+        message_text = input_payload
+    else:
+        texts: list[str] = []
+        for m in input_payload:
+            if isinstance(m, dict) and m.get("role") in ("user", "assistant"):
+                texts.append(str(m.get("content", "")))
+        message_text = texts[-1] if texts else ""
 
+    args = ["openclaw", "agent", "--agent", agent_id, "--message", message_text, "--session-id", session_id, "--json"]
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(url, headers=headers, json=body)
-            if r.status_code >= 400:
-                try:
-                    detail = r.json()
-                except json.JSONDecodeError:
-                    detail = r.text[:800]
-                logger.warning(
-                    "OpenClaw HTTP %s: %s | user_message=%s",
-                    r.status_code,
-                    detail,
-                    _openclaw_http_error_message(r.status_code, detail),
-                )
-                return False, ""
-            data = r.json()
-    except httpx.TimeoutException:
-        logger.warning("OpenClaw request timeout")
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        
+        if proc.returncode != 0:
+            logger.warning("OpenClaw CLI error: %s | stderr=%s", stdout, stderr)
+            return False, ""
+        
+        try:
+            json_start = stdout.find("{")
+            if json_start >= 0:
+                json_str = stdout[json_start:]
+                data = json.loads(json_str)
+            else:
+                data = None
+        except json.JSONDecodeError:
+            logger.warning("OpenClaw CLI output not JSON: %s", stdout)
+            return False, ""
+        
+        if not isinstance(data, dict):
+            return False, ""
+        
+        if data.get("status") != "ok":
+            logger.warning("OpenClaw CLI returned status=%s: %s", data.get("status"), data)
+            return False, ""
+        
+        result = data.get("result", {})
+        payloads = result.get("payloads", [])
+        
+        for p in payloads:
+            if isinstance(p, dict) and p.get("text"):
+                text = str(p["text"]).strip()
+                if text:
+                    if assistant_text_looks_like_api_error_echo(text):
+                        logger.warning(
+                            "OpenClaw reply looks like API/HTTP error echo (suppressed): %s",
+                            text[:500],
+                        )
+                        return False, ""
+                    return True, text
+        
+        logger.warning("OpenClaw: no assistant text in CLI output")
+        return False, ""
+        
+    except asyncio.TimeoutError:
+        logger.warning("OpenClaw CLI timeout")
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         return False, ""
     except Exception as e:
-        logger.exception("OpenClaw request error: %s", e)
+        logger.exception("OpenClaw CLI error: %s", e)
         return False, ""
-
-    text = _extract_openresponses_text(data)
-    if text.startswith("（OpenClaw："):
-        logger.warning("OpenClaw response error text: %s", text)
-        return False, ""
-    if not text:
-        logger.warning("OpenClaw: no assistant text in response body")
-        return False, ""
-    if assistant_text_looks_like_api_error_echo(text):
-        logger.warning(
-            "OpenClaw reply looks like API/HTTP error echo (suppressed): %s",
-            text[:500],
-        )
-        return False, ""
-    return True, text
 
 
 def _openclaw_flatten_user_content(content: object) -> str:

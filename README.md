@@ -1,53 +1,94 @@
-# NoneBot2 ↔ NapCat（正向 WebSocket）
+# aibot
 
-完整使用说明见 **[USAGE.md](USAGE.md)**（安装、配置项、指令、排错等）。
+基于 **NoneBot2** + **NapCatQQ（OneBot v11）** 的 QQ 机器人，支持本地大模型和 OpenClaw Gateway 两种后端，提供私聊/群聊、多轮对话、图片理解和语音回复功能。
 
-## 配置
+---
 
-- **首次克隆**：复制 `llm_config.example.ini` → `llm_config.ini`，`group_whitelist.example.ini` → `group_whitelist.ini`，再按需填写；勿将含真实 token / QQ / 群号的上述 INI 提交到 Git（已由 `.gitignore` 忽略）。
-- 默认在 [`.env`](.env) 中连接 `ws://127.0.0.1:18881`（与 NapCat 面板中的 OneBot 11 **正向 WebSocket** 监听地址一致）。
-- 若 NapCat 要求路径（例如自定义 `ws` 路径），请把 `ONEBOT_WS_URLS` 改成完整地址，如 `["ws://127.0.0.1:18881/xxx"]`。
-- 驱动为 `~fastapi+~websockets`，以支持 WebSocket **客户端**连接。
-- **端口占用（WinError 10048）**：`.env` 里 **`PORT`** 为本机 HTTP 监听端口（与 NapCat WS 无关）。若被占用，改 `PORT`（默认已用较少冲突的 `18080`），或结束占用端口的进程：`netstat -ano | findstr :8081` 后 `taskkill /PID <pid> /F`。
+## 功能特性
 
-## 运行
+- **双后端支持**：本地 OpenAI 兼容接口（LM Studio / Ollama / vLLM 等）或 OpenClaw Gateway
+- **私聊 & 群聊**：私聊直接调用模型；群聊仅白名单群内 @ 机器人时响应
+- **多轮对话**：内存中按用户/群维度保留上下文，支持按轮数/token/时间自动裁剪
+- **图片理解**：发送图片给模型进行多模态理解（需 `backend=local` + 模型支持视觉）
+- **语音回复（TTS）**：Qwen3-TTS 将文字合成为语音，支持语音克隆；超时/失败自动降级为文字
+- **引用上下文**：引用他人消息时，将发送者和原文一并提交给模型
+- **人设记忆**：启动时自动加载 `人设/soul.md` 和 `人设/agent.md` 拼入 system prompt
+- **错误守卫**：自动拦截模型复述 HTTP/接口错误文案的回复，避免向用户暴露错误堆栈
+
+## 架构
+
+```
+QQ 客户端 ←→ NapCatQQ ←→ NoneBot2（aibot）←→ 本地模型 / OpenClaw Gateway
+                    ↑
+              OneBot v11 正向 WebSocket
+```
+
+## 前置要求
+
+- **Python** 3.10+
+- **NapCatQQ**：已安装运行，开启 **OneBot 11 正向 WebSocket**
+- **大模型服务**（二选一）：
+  - **local**：任意提供 `/v1/chat/completions` 的服务（如 LM Studio、Ollama、vLLM）
+  - **openclaw**：OpenClaw Gateway 已启用 `POST /v1/responses`，见 [OpenResponses API 文档](https://docs.openclaw.ai/zh-CN/gateway/openresponses-http-api)
+- **TTS（可选）**：[Qwen3-TTS-12Hz-1.7B-Base](https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base) 及 [Qwen3-TTS-Tokenizer-12Hz](https://modelscope.cn/models/Qwen/Qwen3-TTS-Tokenizer-12Hz)
+
+## 快速开始
+
+### 1. 克隆项目
+
+```bash
+git clone <your-repo-url>
+cd aibot
+```
+
+### 2. 安装依赖
 
 ```bash
 pip install -r requirements.txt
 pip install -e .
+```
+
+### 3. 配置
+
+复制模板文件：
+
+```bash
+copy .env.example .env
+copy llm_config.example.ini llm_config.ini
+copy group_whitelist.example.ini group_whitelist.ini
+```
+
+按需编辑：
+
+- `.env`：NapCat 连接地址（默认 `ws://127.0.0.1:18881`）
+- `llm_config.ini`：大模型后端、人设、多轮参数、TTS 配置
+- `group_whitelist.ini`：允许机器人响应的群号列表
+
+> 配置文件含密钥和个人信息，**勿将 `llm_config.ini` / `group_whitelist.ini` 提交到公开仓库**（`.gitignore` 已忽略）。
+
+### 4. 启动
+
+启动顺序：**先启动 NapCat** → **再启动大模型服务**（若用 local 后端）→ **运行机器人**：
+
+```bash
 python bot.py
 ```
 
-（若只需依赖、不装可编辑包，可只执行 `pip install -r requirements.txt`。）
+日志出现 `Uvicorn running on http://127.0.0.1:18080` 和 `OneBot V11 … connected` 表示连接成功。
 
-顺序：**先启动 NapCat 并登录 QQ**；若使用 **本地模型** 或 **OpenClaw Gateway**，请先启动对应服务，再运行本仓库。
+详细配置说明见 **[USAGE.md](USAGE.md)**。
 
-- **私聊**：发文字 → 按 [`llm_config.ini`](llm_config.ini) 调用模型。**`backend=openclaw` 时**，仅 [`[openclaw] private_allow_qq`](llm_config.ini) 名单内的 QQ 会请求 Gateway；其他人私聊**不调 OpenClaw、也不回复**。**`backend=local` 时**私聊无此限制。
-- **群聊**：仅当群号在 [`group_whitelist.ini`](group_whitelist.ini) 的 `[groups]` 中，且 **@ 机器人** 时回复（默认白名单含 `1095070178`）。
+## 项目结构
 
-### 大模型切换（`llm_config.ini`）
-
-- **`[llm]` → `backend`**：`openclaw` 或 `local`。
-- **`[openclaw]`**：`base_url`、`token`、`instructions` 等。需在 OpenClaw 中启用 OpenResponses 端点，见 [OpenResponses API](https://docs.openclaw.ai/zh-CN/gateway/openresponses-http-api)。
-  - **`subagent_id`（推荐）**：填写子智能体 id 后，请求使用 **`x-openclaw-agent-id: <subagent_id>`**；**`model`** 须为 **`openclaw`** 或 **`openclaw/<agentId>`**（斜杠），留空时程序发 **`openclaw`**。
-  - 未填 `subagent_id` 时使用 **`agent_id`**；二者至少填一个。`model` 可留空以自动拼接。
-  - **`private_allow_qq`**：`backend=openclaw` 时仅这些 QQ 的**私聊**会发到 Gateway；名单为空则**无人**可走 OpenClaw 私聊。
-- **`[local]`**：`base_url`、`api_key`、`model`、`supports_vision`、`vision_max_long_edge`（默认 1280，**0**=不限制）、`vision_max_image_bytes`、`vision_jpeg_quality`、`system_prompt`（人设）等；带图时若启用「龙虾记忆」仍会合并 `soul.md`/`agent.md`，并附加多模态回复约定。
-
-可选环境变量 **`LLM_CONFIG_INI`** 指定其它 INI 路径（相对路径相对项目根目录）。
-
-### 多轮对话（内存）
-
-在 [`llm_config.ini`](llm_config.ini) 的 **`[llm]`** 中：`history_enable`、`history_max_rounds`（用户+助手对数）、`history_max_tokens`（按字符粗估 token）、`history_ttl_seconds`（闲置秒数后清空该会话桶，0 表示不按时间清）。
-
-- **私聊**桶：`priv:<QQ>`；**群聊**桶：`grp:<群号>:<QQ>`（同群不同人互不串）。
-- 私聊或群内 @ 机器人发 **`/清空`** 或 **`/clear`** 可清空对应桶。
-- 私聊发 **`/清空全部记忆`**：仅当 [`memory_clear_master_qq`](llm_config.ini) 非空且你在名单中时，会清空**所有用户/群**的对话桶；留空则关闭（防误触）。
-- **重启 `python bot.py` 也会清空全部内存历史**（未接数据库）。
-- **`backend=local`** 且 `[llm] 龙虾记忆=true`：启动时读取 **[`人设`](人设/)** 下 **`soul.md` / `agent.md`**（排除 `USER.md`）并入 `system`；默认目录为项目内 `人设/`，也可用 `openclaw_workspace_path` 指向其它路径（也可用英文键 `openclaw_workspace_memory`，以 `龙虾记忆` 为准），详见 [USAGE.md](USAGE.md)。
-
-### 群聊没回复时排查
-
-- 群号是否在 [`group_whitelist.ini`](group_whitelist.ini) 的 `[groups]` 里（与 QQ 里显示的群号一致）。
-- 是否 **@ 了当前登录的机器人**，且 **@ 后面有文字**（仅 @ 无字会收到提示，不会调模型）。
-- 本地模型：`[local]` 的 `base_url` 需指向 OpenAI 兼容根路径，代码会自动补全 **`/v1`**；模型服务需已启动。
+| 路径 | 说明 |
+|------|------|
+| `bot.py` | 入口：加载环境变量、注册适配器、加载插件、启动检查 |
+| `openclaw_memory.py` | 启动时读取人设目录（`人设/`）的 soul.md / agent.md |
+| `plugins/echo/` | 核心插件：消息处理、白名单、历史、LLM 调用、TTS |
+| `llm_config.ini` | 大模型后端与多轮对话配置（含敏感信息，勿上传） |
+| `group_whitelist.ini` | 群聊白名单（勿上传） |
+| `.env` | NapCat 连接与本机 HTTP 端口配置 |
+| `人设/` | 人设文件：soul.md（身份）、agent.md（行为约束） |
+| `voice_ref/` | TTS 语音克隆参考音频（勿上传） |
+| `models/` | Qwen3-TTS 模型文件（勿上传） |
+| `scripts/test_onebot_ws.py` | NapCat WebSocket 连接诊断工具 |

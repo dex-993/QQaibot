@@ -8,6 +8,7 @@ from nonebot.adapters.onebot.v11 import (
     Bot,
     GroupMessageEvent,
     MessageEvent,
+    MessageSegment,
     PokeNotifyEvent,
     PrivateMessageEvent,
 )
@@ -28,6 +29,7 @@ from .message_image import (
 )
 from .llm_reply import reply_with_configured_llm
 from .quoted_context import build_user_prompt_with_quote, quoted_reply_to_text_prefix
+from .tts import cleanup_temp_file, synthesize_speech, tts_is_available
 from .whitelist import load_group_ids
 
 logger = logging.getLogger(__name__)
@@ -173,6 +175,7 @@ async def _(bot: Bot, event: PrivateMessageEvent) -> None:
         return
     if get_backend() == "openclaw" and not openclaw_private_allowed(str(event.user_id)):
         return
+
     reply = await reply_with_configured_llm(
         full_text,
         str(event.user_id),
@@ -180,8 +183,21 @@ async def _(bot: Bot, event: PrivateMessageEvent) -> None:
         group_id=None,
         image_data_uris=merged_uris or None,
     )
-    if (reply or "").strip():
-        await bot.send(event, reply)
+    if not (reply or "").strip():
+        return
+
+    # TTS：优先发语音，超时/失败降级为文字
+    if tts_is_available():
+        audio_path, is_silk = await synthesize_speech(reply)
+        if audio_path:
+            try:
+                await bot.send(event, MessageSegment.record(file=audio_path))
+                cleanup_temp_file(audio_path)
+                return
+            except Exception:
+                cleanup_temp_file(audio_path)
+                logger.warning("voice send failed, falling back to text")
+    await bot.send(event, reply)
 
 
 _grp = on_message(rule=_group_whitelist_only(), priority=10, block=False)
@@ -201,13 +217,13 @@ async def _(bot: Bot, event: GroupMessageEvent) -> None:
             if lines
             else "请 @ 我之后输入要聊的内容（仅 @ 没有文字时我不会调用模型）。"
         )
-        await bot.send(event, msg)
+        await bot.send(event, MessageSegment.reply(event.message_id) + msg)
         return
     if text_plain.lower() in ("/清空", "/clear"):
         clear_session(
             history_key("group", str(event.user_id), str(event.group_id)),
         )
-        await bot.send(event, "已清空你在本群的对话记忆。")
+        await bot.send(event, MessageSegment.reply(event.message_id) + "已清空你在本群的对话记忆。")
         return
     prefix = quoted_reply_to_text_prefix(rep)
     quoted_uris: list[str] = []
@@ -247,8 +263,27 @@ async def _(bot: Bot, event: GroupMessageEvent) -> None:
         group_id=str(event.group_id),
         image_data_uris=merged_uris or None,
     )
-    if (reply or "").strip():
-        await bot.send(event, reply)
+    if not (reply or "").strip():
+        return
+
+    # TTS：优先发语音，超时/失败降级为文字
+    if tts_is_available():
+        logger.info("[TTS] synthesizing voice (len=%d)", len(reply))
+        audio_path, is_silk = await synthesize_speech(reply)
+        if audio_path:
+            try:
+                # 语音不走 reply 段，直接发语音
+                await bot.send(event, MessageSegment.record(file=audio_path))
+                cleanup_temp_file(audio_path)
+                return
+            except Exception:
+                cleanup_temp_file(audio_path)
+                logger.warning("group voice send failed, falling back to text")
+        else:
+            logger.info("[TTS] synthesize returned empty, sending text")
+    else:
+        logger.info("[TTS] not available, sending text")
+    await bot.send(event, MessageSegment.reply(event.message_id) + reply)
 
 
 _poke = on_notice(rule=_poke_only(), priority=10, block=False)
