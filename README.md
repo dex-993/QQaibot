@@ -150,7 +150,7 @@ python bot.py
 > ```
 > 保存后重启 OpenClaw Gateway。
 
-#### `[tts]` — 语音合成（TTS 仅 `backend=local` 时可用）
+#### `[tts]` — 语音合成
 
 | 项 | 默认值 | 说明 |
 |----|--------|------|
