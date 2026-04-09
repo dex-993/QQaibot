@@ -182,6 +182,7 @@ async def _(bot: Bot, event: PrivateMessageEvent) -> None:
         chat_scope="private",
         group_id=None,
         image_data_uris=merged_uris or None,
+        sender_label=f"【私聊消息 | 发送者：{event.sender.nickname or str(event.user_id)}（QQ {event.user_id}）】",
     )
     if not (reply or "").strip():
         return
@@ -262,6 +263,7 @@ async def _(bot: Bot, event: GroupMessageEvent) -> None:
         chat_scope="group",
         group_id=str(event.group_id),
         image_data_uris=merged_uris or None,
+        sender_label=f"【群消息 | 发送者：{event.sender.card or event.sender.nickname or str(event.user_id)}（QQ {event.user_id}）】",
     )
     if not (reply or "").strip():
         return

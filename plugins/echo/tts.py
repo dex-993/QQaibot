@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import logging
 import tempfile
 from pathlib import Path
@@ -63,6 +64,31 @@ def _tts_enabled() -> bool:
 
 def _tts_config() -> dict[str, str]:
     return section_dict("tts")
+
+
+# Unicode ranges covering virtually all emoji characters
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"  # emoticons
+    "\U0001F300-\U0001F5FF"  # misc symbols and pictographs
+    "\U0001F680-\U0001F6FF"  # transport and map symbols
+    "\U0001F700-\U0001F77F"  # alchemical symbols
+    "\U0001F780-\U0001F7FF"  # geometric shapes extended
+    "\U0001F800-\U0001F8FF"  # supplemental arrows
+    "\U0001F900-\U0001F9FF"  # supplemental symbols and pictographs
+    "\U0001FA00-\U0001FA6F"  # chess, symbols
+    "\U0001FA70-\U0001FAFF"  # symbols and pictographs extended
+    "\U00002600-\U000026FF"  # misc symbols
+    "\U00002700-\U000027BF"  # dingbats
+    "\U0001F200-\U0001F2FF"  # enclosed alphanumerics
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _strip_emoji(text: str) -> str:
+    """去除所有表情符号，返回纯文本。"""
+    return _EMOJI_RE.sub("", text)
 
 
 def _wav_duration_seconds(wav_path: str) -> float:
@@ -131,6 +157,7 @@ async def synthesize_speech(text: str) -> tuple[str, bool]:
     explicit_ref_audio = (cfg.get("ref_audio") or "").strip()
     ref_text = (cfg.get("ref_text") or "").strip()
 
+    text = _strip_emoji(text)
     if not text or not text.strip():
         return "", False
 
