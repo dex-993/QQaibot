@@ -78,6 +78,8 @@ python bot.py
 
 详细配置说明见 **[USAGE.md](USAGE.md)**。
 
+**新手？从零开始部署请看 [QUICKSTART.md](QUICKSTART.md)**，包含 NapCat 安装、LM Studio 配置、TTS 模型下载完整步骤。
+
 ## 项目结构
 
 | 路径 | 说明 |
