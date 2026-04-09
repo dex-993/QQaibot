@@ -34,7 +34,7 @@ QQ 客户端 ←→ NapCatQQ ←→ NoneBot2（aibot）←→ 本地模型 / Ope
 - **大模型服务**（二选一）：
   - **local**：任意提供 `/v1/chat/completions` 的服务（LM Studio、Ollama、vLLM 等）
   - **openclaw**：OpenClaw Gateway 已启用 `POST /v1/responses`，见 [OpenResponses API 文档](https://docs.openclaw.ai/zh-CN/gateway/openresponses-http-api)
-- **TTS（可选）**：[Qwen3-TTS-12Hz-1.7B-Base](https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base) 及 [Qwen3-TTS-Tokenizer-12Hz](https://modelscope.cn/models/Qwen/Qwen3-TTS-Tokenizer-12Hz)
+- **TTS（可选）**：[Qwen3-TTS-12Hz-1.7B-Base](https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base)（约 3.6 GB），Tokenizer 若与模型同目录则自动找到，无需单独配置
 
 ---
 
@@ -168,20 +168,15 @@ python bot.py
 
 TTS 为可选功能，不安装则只发文字回复。
 
-### 模型文件 1：Qwen3-TTS Base（约 3.6 GB）
+### TTS 模型下载
 
-从 [ModelScope](https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base) 下载，文件夹放入 `models/`，最终路径：
+从 [ModelScope](https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base) 下载完整文件夹，放入 `models/`，最终路径：
 
 ```
 E:\aibot\models\Qwen3-TTS-12Hz-1.7B-Base\
 ```
 
-### 模型文件 2：Qwen3-TTS Tokenizer（几百 MB）
-
-```bash
-pip install modelscope
-modelscope download --model Qwen/Qwen3-TTS-Tokenizer-12Hz --local_dir E:\aibot\models\Qwen3-TTS-Tokenizer-12Hz
-```
+文件夹内需包含 `model.safetensors`（主模型，约 3.6 GB，需单独下载）和 Tokenizer 文件（在同一目录下会自动找到，无需单独配置）。
 
 ### 语音克隆参考音频（可选）
 
@@ -300,4 +295,4 @@ aibot/
 - **勿**将含 token、QQ 号、群号的配置文件提交到公开仓库；`.gitignore` 已忽略 `llm_config.ini` 和 `group_whitelist.ini`
 - 使用非官方 QQ 协议存在**封号与合规风险**，请自行评估
 - TTS 参考音频含个人声音特征，勿提交 `voice_ref/` 中的音频文件
-- models 目录仅含 Tokenizer 和配置文件；主模型（约 3.6 GB）需自行下载
+- models 目录仅含配置和 Tokenizer；主模型文件 `model.safetensors`（约 3.6 GB）需自行下载到 `models/Qwen3-TTS-12Hz-1.7B-Base/`
