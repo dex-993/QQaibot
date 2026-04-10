@@ -164,10 +164,10 @@ TTS 为可选功能，不安装则只发文字回复。
 
 ### TTS 模型下载
 
-从 [ModelScope](https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base) 下载完整文件夹，放入 `models/`，最终路径：
+从 [ModelScope](https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base) 下载完整文件夹，放入项目根目录下的 `models/`，最终路径：
 
 ```
-E:\aibot\models\Qwen3-TTS-12Hz-1.7B-Base\
+models/Qwen3-TTS-12Hz-1.7B-Base/
 ```
 
 文件夹内需包含 `model.safetensors`（主模型，约 3.6 GB，需单独下载）和 Tokenizer 文件（在同一目录下会自动找到，无需单独配置）。
