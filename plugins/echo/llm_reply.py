@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
 import httpx
-from openai import APIStatusError, APITimeoutError, AsyncOpenAI, OpenAIError
 
 import openclaw_memory
 
@@ -28,23 +26,6 @@ _VISION_SYSTEM_SUFFIX = (
     "结合对方的文字（若有）和图片来答。除非对方明确要求你描述、讲解或辨认画面内容，"
     "否则以对话接续为主，不要把整段回复写成纯画面说明。"
 )
-
-
-def _openai_compatible_error_detail(body: object | None) -> str:
-    """从 OpenAI 兼容错误 JSON 中取出简短说明（便于排查 400）。"""
-    if body is None:
-        return ""
-    if isinstance(body, dict):
-        err = body.get("error")
-        if isinstance(err, dict) and err.get("message"):
-            return str(err["message"]).strip()[:500]
-        if isinstance(err, str) and err.strip():
-            return err.strip()[:500]
-        if body.get("message"):
-            return str(body["message"]).strip()[:500]
-    if isinstance(body, str) and body.strip():
-        return body.strip()[:500]
-    return ""
 
 
 def _extract_openresponses_text(data: Any) -> str:
@@ -214,13 +195,6 @@ def _normalize_openclaw_base_url(url: str) -> str:
     return u
 
 
-def _normalize_openai_base_url(url: str) -> str:
-    u = url.strip().rstrip("/")
-    if not u.endswith("/v1"):
-        u = f"{u}/v1"
-    return u
-
-
 def _normalize_lm_native_url(url: str) -> str:
     """LM Studio native API URL：去掉 /v1 后缀，拼上 /api/v1/chat。"""
     u = url.strip().rstrip("/")
@@ -350,31 +324,6 @@ async def _call_local(
     return True, text
 
 
-def _openclaw_http_error_message(status_code: int, detail: Any) -> str:
-    """把网关返回体压缩成用户可读短句，502 附带常见原因提示。"""
-    extra = ""
-    if isinstance(detail, dict):
-        err = detail.get("error")
-        if isinstance(err, dict) and err.get("message"):
-            extra = str(err["message"]).strip()[:300]
-        elif isinstance(err, str):
-            extra = err.strip()[:300]
-        elif detail.get("message"):
-            extra = str(detail["message"]).strip()[:300]
-    elif isinstance(detail, str) and detail.strip():
-        extra = detail.strip()[:300]
-
-    hint_502 = (
-        " 常见原因：① 网关后「上游模型/API」不可用或未配置；② 未在 OpenClaw 中启用 "
-        "`gateway.http.endpoints.responses`；③ 智能体绑定的提供商密钥/网络异常。"
-    )
-    hint = hint_502 if status_code == 502 else ""
-
-    if extra:
-        return f"（OpenClaw HTTP {status_code}：{extra}）{hint}".strip()
-    return f"（OpenClaw HTTP {status_code}）{hint}".strip()
-
-
 def _openclaw_flatten_user_content(content: object) -> str:
     """OpenClaw 仅走文本：多模态 user 只取 text 段。"""
     if isinstance(content, str):
@@ -407,30 +356,6 @@ def _prepend_sender_label(
                 first["content"] = f"{sender_label}\n{ct}"
                 return [first] + list(content[1:])
     return content
-
-
-def _openclaw_input_from_history(
-    hist: list[dict[str, Any]],
-    sender_label: str = "",
-) -> str | list[dict[str, Any]]:
-    if len(hist) == 1 and hist[0].get("role") == "user":
-        raw = hist[0].get("content")
-        tagged = _prepend_sender_label(raw, sender_label) if sender_label else raw
-        return _openclaw_flatten_user_content(tagged)
-    items: list[dict[str, Any]] = []
-    for m in hist:
-        role = m.get("role", "user")
-        raw = m.get("content", "")
-        if role == "user":
-            content = _openclaw_flatten_user_content(
-                _prepend_sender_label(raw, sender_label) if sender_label else raw,
-            )
-        else:
-            content = raw if isinstance(raw, str) else _openclaw_flatten_user_content(raw)
-        if role not in ("user", "assistant", "system"):
-            role = "user"
-        items.append({"type": "message", "role": role, "content": content})
-    return items
 
 
 async def reply_with_configured_llm(

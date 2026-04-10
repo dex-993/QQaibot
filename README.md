@@ -155,7 +155,6 @@ python bot.py
 | `ref_text` | （空） | `ref_audio` 对应的文字（必填，否则无法克隆） |
 | `language` | `Chinese` | 合成语种 |
 | `max_duration_seconds` | `60` | 语音最大时长；超出降级为文字。QQ 单条语音上限 60 秒 |
-| `prefer_voice` | `true` | `true` = 优先发语音，超时改文字；`false` = 只发文字 |
 
 ---
 
