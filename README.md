@@ -198,9 +198,9 @@ models/Qwen3-TTS-12Hz-1.7B-Base/
 
 | 场景 | 指令 | 效果 |
 |------|------|------|
-| 私聊 | `/清空` 或 `/clear` | 清空自己的私聊 session |
-| 群内（需 @） | `/清空` 或 `/clear` | 清空自己在该群的 session |
-| 私聊 | `/清空全部记忆` | 仅 `memory_clear_master_qq` 中的 QQ 可用：清空所有用户的 session |
+| 私聊 | `/清空` 或 `/clear` | 清空自己的私聊 session（仅 `backend=local` 时有效） |
+| 群内（需 @） | `/清空` 或 `/clear` | 清空自己在该群的 session（仅 `backend=local` 时有效） |
+| 私聊 | `/清空全部记忆` | 仅 `memory_clear_master_qq` 中的 QQ 可用：清空所有用户的 session（仅 `backend=local` 时有效） |
 
 ### 戳一戳
 
