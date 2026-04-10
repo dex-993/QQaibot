@@ -8,7 +8,7 @@ _QUOTED_TEXT_MAX = 3500
 
 
 def quoted_reply_to_text_prefix(reply: Reply | None) -> str:
-    """将被引消息的发送者与正文写入前缀（不含图片；图片由 resolve_images_from_message 另行传入）。"""
+    """将被引消息的发送者与正文写入前缀；图片由 __init__.py 的 _resolve_image_uris 另行传入。"""
     if reply is None:
         return ""
     sender = reply.sender

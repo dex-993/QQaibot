@@ -11,11 +11,12 @@ from openai import APIStatusError, APITimeoutError, AsyncOpenAI, OpenAIError
 
 import openclaw_memory
 
-from .chat_history import ChatScope, HistorySession, history_key
-from .llm_ini import get_backend, get_history_config, model_supports_vision, section_dict
+from .chat_history import ChatScope, _lm_response_ids
+from .llm_ini import get_backend, section_dict
 from .reply_error_echo_guard import assistant_text_looks_like_api_error_echo
 
 logger = logging.getLogger(__name__)
+
 
 # 仅发图、无附言时占位；勿引导模型「默认描述画面」，以免压过 soul/agent 里的聊天人设
 _DEFAULT_VISION_USER_TEXT = (
@@ -220,6 +221,15 @@ def _normalize_openai_base_url(url: str) -> str:
     return u
 
 
+def _normalize_lm_native_url(url: str) -> str:
+    """LM Studio native API URL：去掉 /v1 后缀，拼上 /api/v1/chat。"""
+    u = url.strip().rstrip("/")
+    for suffix in ("/v1", "/v1/chat/completions"):
+        if u.lower().endswith(suffix):
+            u = u[: -len(suffix)].rstrip("/")
+    return f"{u}/api/v1/chat"
+
+
 def _build_multimodal_user_content(
     user_text: str,
     image_data_uris: list[str],
@@ -237,86 +247,107 @@ def _build_multimodal_user_content(
     return parts
 
 
-def _text_parts_from_multimodal(content: list[Any]) -> str:
-    """从多模态 user content 里只取 text 段（用于历史里去掉旧图）。"""
-    texts: list[str] = []
-    for x in content:
-        if isinstance(x, dict) and x.get("type") == "text":
-            texts.append(str(x.get("text", "")))
-    return "\n".join(texts).strip()
-
-
-def collapse_old_vision_in_history(hist: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """LM Studio / Jinja 对「多轮里多条带图 user」支持差，且重复塞 data: 图会巨大。
-
-    只保留**最后一条** user 的多模态；更早的带图 user 压成纯文字（保留当时的文字说明）。
-    """
-    last_user_i = -1
-    for i in range(len(hist) - 1, -1, -1):
-        if hist[i].get("role") == "user":
-            last_user_i = i
-            break
-    if last_user_i < 0:
-        return [dict(m) for m in hist]
-    out: list[dict[str, Any]] = []
-    for i, m in enumerate(hist):
-        row = dict(m)
-        c = row.get("content")
-        if row.get("role") == "user" and isinstance(c, list) and i != last_user_i:
-            t = _text_parts_from_multimodal(c)
-            row["content"] = t if t else "[用户发送过一张图片]"
-        out.append(row)
-    return out
-
-
 async def _call_local(
-    messages: list[dict[str, Any]],
+    input_payload: list[dict[str, Any]],
+    system_prompt: str,
+    session_key: str,
 ) -> tuple[bool, str]:
     loc = section_dict("local")
-    base_url = _normalize_openai_base_url(
-        (loc.get("base_url") or "http://127.0.0.1:11434/v1").strip(),
+    base_url = _normalize_lm_native_url(
+        (loc.get("base_url") or "http://127.0.0.1:1234").strip(),
     )
-    api_key = (loc.get("api_key") or "ollama").strip()
-    model = (loc.get("model") or "qwen2.5:latest").strip()
+    api_key = (loc.get("api_key") or "lm-studio").strip()
+    model = (loc.get("model") or "").strip()
     timeout = float(loc.get("timeout_seconds") or "120")
 
-    client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    previous_id = _lm_response_ids.get(session_key, "")
+    # LM Studio /api/v1/chat input 格式：扁平数组，每个 item 是 {"type": "text", "content": "..."} 或 {"type": "image", "data_url": "..."}
+    message_content: list[dict[str, Any]] = []
+    for item in input_payload:
+        if isinstance(item, dict) and item.get("type") == "text":
+            message_content.append({"type": "text", "content": item.get("text", "")})
+        elif isinstance(item, dict) and item.get("type") == "image_url":
+            url = item.get("image_url", {})
+            if isinstance(url, dict):
+                data_url = url.get("url", "")
+            else:
+                data_url = str(url)
+            message_content.append({"type": "image", "data_url": data_url})
+
+    body: dict[str, Any] = {
+        "model": model,
+        "input": message_content,
+    }
+    if system_prompt:
+        body["system_prompt"] = system_prompt
+    if previous_id:
+        body["previous_response_id"] = previous_id
+
+    logger.info("[Local] POST %s previous_id=%s", base_url, previous_id or "(none)")
+
     try:
-        resp = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.7,
-        )
-        choice = resp.choices[0].message
-        out = (choice.content or "").strip()
-        if not out:
-            logger.warning("Local LLM returned empty content")
-            return False, ""
-        if assistant_text_looks_like_api_error_echo(out):
-            logger.warning(
-                "Local LLM reply looks like API/HTTP error echo (suppressed): %s",
-                out[:500],
-            )
-            return False, ""
-        return True, out
-    except APITimeoutError:
-        logger.warning("Local LLM request timeout")
-        return False, ""
-    except APIStatusError as e:
-        detail = _openai_compatible_error_detail(e.body)
-        logger.warning(
-            "Local LLM HTTP %s: %s (%s)",
-            e.status_code,
-            e.body,
-            detail or "no detail",
-        )
-        return False, ""
-    except OpenAIError as e:
-        logger.warning("Local LLM OpenAI error: %s", e)
-        return False, ""
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(base_url, headers=headers, json=body)
     except Exception:
-        logger.exception("Local LLM unexpected error")
+        logger.exception("Local LLM HTTP request failed")
         return False, ""
+
+    if resp.status_code != 200:
+        logger.warning(
+            "Local LLM HTTP %s: %s",
+            resp.status_code,
+            resp.text[:500],
+        )
+        return False, ""
+
+    try:
+        data = resp.json()
+    except Exception:
+        logger.warning("Local LLM response not JSON: %s", resp.text[:500])
+        return False, ""
+
+    # 提取文本回复
+    text = ""
+    output = data if isinstance(data, dict) else {}
+    for item in output.get("output", []):
+        if isinstance(item, dict) and item.get("type") == "message":
+            content = item.get("content")
+            # content 可能是字符串或列表；字符串直接取，列表才遍历
+            if isinstance(content, str) and content.strip():
+                text = content.strip()
+                break
+            if isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "output_text":
+                        t = (c.get("text") or "").strip()
+                        if t:
+                            text = t
+                            break
+                if text:
+                    break
+
+    if not text:
+        logger.warning("Local LLM returned empty content")
+        return False, ""
+
+    if assistant_text_looks_like_api_error_echo(text):
+        logger.warning(
+            "Local LLM reply looks like API/HTTP error echo (suppressed): %s",
+            text[:500],
+        )
+        return False, ""
+
+    # 保存 response_id 供下次调用
+    resp_id = (data.get("response_id") or "") if isinstance(data, dict) else ""
+    if resp_id:
+        _lm_response_ids[session_key] = resp_id
+
+    return True, text
 
 
 def _openclaw_http_error_message(status_code: int, detail: Any) -> str:
@@ -411,98 +442,79 @@ async def reply_with_configured_llm(
     image_data_uris: list[str] | None = None,
     sender_label: str = "",
 ) -> str:
-    """按 backend 路由；可选多轮（内存）。本地 + supports_vision 时可传图。"""
-    cfg_hist = get_history_config()
-    key = (
-        history_key(chat_scope, user_id, group_id) if cfg_hist["enable"] else None
-    )
+    """按 backend 路由，多轮上下文由各后端自行维护（OpenClaw=session key，LM Studio=response_id）。"""
 
     uris = [u for u in (image_data_uris or []) if u]
     backend = get_backend()
-    vision = model_supports_vision()
-    use_local_vision = bool(
-        backend == "local" and vision and uris,
-    )
-    async with HistorySession(key) as hs:
-        if hs.active:
-            if use_local_vision:
-                mm = _build_multimodal_user_content(user_text, uris)
-                hs.append_user_multimodal(mm)
-            else:
-                hs.append_user(user_text)
 
-        if backend == "openclaw":
-            oc = section_dict("openclaw")
+    if backend == "openclaw":
+        oc = section_dict("openclaw")
 
-            resolved = _openclaw_resolve_agent(oc)
-            if resolved is None:
-                logger.error(
-                    "OpenClaw: subagent_id and agent_id both missing (user_id=%s)",
-                    user_id,
-                )
-                if hs.active:
-                    hs.rollback_user()
-                return ""
-
-            agent_id = resolved
-            timeout = float(oc.get("timeout_seconds") or "120")
-
-            base_instr = (oc.get("instructions") or "").strip()
-            if chat_scope == "group":
-                group_suffix = (oc.get("group_instructions_suffix") or "").strip()
-                instr = base_instr
-                if group_suffix:
-                    instr = (base_instr + "\n\n" + group_suffix) if base_instr else group_suffix
-            else:
-                instr = base_instr
-
-            # 只需发当前消息，上下文由 OpenClaw session 维护
-            current_text = _openclaw_flatten_user_content(
-                _prepend_sender_label(user_text, sender_label) if sender_label else user_text
+        resolved = _openclaw_resolve_agent(oc)
+        if resolved is None:
+            logger.error(
+                "OpenClaw: subagent_id and agent_id both missing (user_id=%s)",
+                user_id,
             )
-            ok, reply = await _call_openclaw(
-                chat_scope=chat_scope,
-                user_id=user_id,
-                group_id=group_id,
-                input_payload=current_text,
-                oc=oc,
-                agent_id=agent_id,
-                instructions=instr,
-                timeout=timeout,
-            )
+            return ""
+
+        agent_id = resolved
+        timeout = float(oc.get("timeout_seconds") or "120")
+
+        base_instr = (oc.get("instructions") or "").strip()
+        if chat_scope == "group":
+            group_suffix = (oc.get("group_instructions_suffix") or "").strip()
+            instr = base_instr
+            if group_suffix:
+                instr = (base_instr + "\n\n" + group_suffix) if base_instr else group_suffix
         else:
-            loc = section_dict("local")
-            base_system = (loc.get("system_prompt") or "你是一个友好的聊天助手。").strip()
-            ocw = openclaw_memory.get_workspace_bundle()
-            if ocw:
-                base_system = (
-                    f"{base_system}\n\n---\n【工作区记忆（soul.md / agent.md，已排除 USER.md）】\n"
-                    f"{ocw}"
-                )
-            if use_local_vision:
-                base_system = base_system + _VISION_SYSTEM_SUFFIX
-            # 只需发当前消息（+ 附图），上下文由 session 维护
-            if use_local_vision:
-                body_content = _build_multimodal_user_content(user_text, uris)
-            else:
-                body_content = user_text
-            messages: list[dict[str, Any]] = (
-                [{"role": "system", "content": base_system}]
-                + [{"role": "user", "content": body_content}]
+            instr = base_instr
+
+        # 只需发当前消息，上下文由 OpenClaw session 维护
+        current_text = _openclaw_flatten_user_content(
+            _prepend_sender_label(user_text, sender_label) if sender_label else user_text
+        )
+        ok, reply = await _call_openclaw(
+            chat_scope=chat_scope,
+            user_id=user_id,
+            group_id=group_id,
+            input_payload=current_text,
+            oc=oc,
+            agent_id=agent_id,
+            instructions=instr,
+            timeout=timeout,
+        )
+    else:
+        loc = section_dict("local")
+        base_system = (loc.get("system_prompt") or "你是一个友好的聊天助手。").strip()
+        ocw = openclaw_memory.get_workspace_bundle()
+        if ocw:
+            base_system = (
+                f"{base_system}\n\n---\n【工作区记忆（soul.md / agent.md，已排除 USER.md）】\n"
+                f"{ocw}"
             )
-            ok, reply = await _call_local(messages)
+        if uris:
+            base_system = base_system + _VISION_SYSTEM_SUFFIX
+        input_payload: list[dict[str, Any]] = []
+        if uris:
+            raw_content = _build_multimodal_user_content(user_text, uris)
+        else:
+            raw_content = [{"type": "text", "text": user_text}]
+        # 群聊时标注发送者身份，让模型知道"谁在说话"
+        labeled = _prepend_sender_label(raw_content, sender_label) if sender_label else raw_content
+        if isinstance(labeled, list):
+            input_payload = labeled
+        else:
+            input_payload = [{"type": "text", "text": str(labeled)}]
+        local_key = f"local:{chat_scope}:{user_id}" + (f":{group_id}" if group_id else "")
+        ok, reply = await _call_local(input_payload, base_system, session_key=local_key)
 
-        text_out = (reply or "").strip() if ok else ""
-        if hs.active:
-            if text_out:
-                hs.append_assistant(text_out)
-            else:
-                if ok:
-                    logger.warning(
-                        "LLM returned empty reply after success (user_id=%s scope=%s)",
-                        user_id,
-                        chat_scope,
-                    )
-                hs.rollback_user()
+    text_out = (reply or "").strip() if ok else ""
+    if not text_out and ok:
+        logger.warning(
+            "LLM returned empty reply after success (user_id=%s scope=%s)",
+            user_id,
+            chat_scope,
+        )
 
-        return text_out
+    return text_out

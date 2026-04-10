@@ -1,14 +1,14 @@
 # aibot - QQ 机器人
 
-基于 **NoneBot2** + **NapCatQQ（OneBot v11）** 的 QQ 机器人，支持本地大模型和 OpenClaw Gateway 两种后端，提供私聊/群聊、多轮对话、图片理解和语音回复功能。
+基于 **NoneBot2** + **NapCatQQ（OneBot v11）** 的 QQ 机器人，支持本地大模型和 OpenClaw Gateway 两种后端，提供私聊/群聊、多轮对话（服务端维护）、图片理解和语音回复功能。
 
 ---
 
 ## 功能特性
 
-- **双后端支持**：本地 OpenAI 兼容接口（LM Studio / Ollama / vLLM 等）或 OpenClaw Gateway
+- **双后端支持**：本地 LM Studio 或 OpenClaw Gateway
 - **私聊 & 群聊**：私聊直接调用模型；群聊仅白名单群内 @ 机器人时响应
-- **多轮对话**：内存中按用户/群维度保留上下文，支持按轮数/token/时间自动裁剪
+- **多轮对话**：多轮上下文由各后端自行维护（OpenClaw=session key，LM Studio=previous_response_id）
 - **图片理解**：发送图片给模型进行多模态理解（需 `backend=local` + 模型支持视觉）
 - **语音回复（TTS）**：Qwen3-TTS 将文字合成为语音，支持语音克隆；超时/失败自动降级为文字
 - **引用上下文**：引用他人消息时，将发送者和原文一并提交给模型
@@ -32,7 +32,7 @@ QQ 客户端 ←→ NapCatQQ ←→ NoneBot2（aibot）←→ 本地模型 / Ope
 - **Python** 3.10+
 - **NapCatQQ**：已安装运行，开启 **OneBot 11 正向 WebSocket**
 - **大模型服务**（二选一）：
-  - **local**：任意提供 `/v1/chat/completions` 的服务（LM Studio、Ollama、vLLM 等）
+  - **local**：本地 LM Studio 服务
   - **openclaw**：OpenClaw Gateway 已启用 `POST /v1/responses`，见 [OpenResponses API 文档](https://docs.openclaw.ai/zh-CN/gateway/openresponses-http-api)
 - **TTS（可选）**：[Qwen3-TTS-12Hz-1.7B-Base](https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base)（约 3.6 GB），Tokenizer 若与模型同目录则自动找到，无需单独配置
 
@@ -61,7 +61,7 @@ copy group_whitelist.example.ini group_whitelist.ini
 
 按需编辑：
 - `.env`：NapCat 连接地址（默认 `ws://127.0.0.1:18881`）
-- `llm_config.ini`：大模型后端、人设、多轮参数、TTS 配置
+- `llm_config.ini`：大模型后端、人设、TTS 配置
 - `group_whitelist.ini`：允许机器人响应的群号列表
 
 > 配置文件含密钥和个人信息，**勿将 `llm_config.ini` / `group_whitelist.ini` 提交到公开仓库**（`.gitignore` 已忽略）。
@@ -110,26 +110,21 @@ python bot.py
 
 | 项 | 默认值 | 说明 |
 |----|--------|------|
-| `backend` | `local` | `local`（OpenAI 兼容）或 `openclaw`（OpenClaw Gateway） |
-| `history_enable` | `true` | 启用多轮对话（内存，非持久化） |
-| `history_max_rounds` | `10` | 每会话最多保留的「用户 + 助手」轮次 |
-| `history_max_tokens` | `4000` | 历史 token 上限（按字符数 ÷ 4 粗估） |
-| `history_ttl_seconds` | `1800` | 会话闲置秒数后清空；`0` = 不按时间清空 |
+| `backend` | `local` | `local`（LM Studio）或 `openclaw`（OpenClaw Gateway） |
 | `龙虾记忆` | `true` | 仅 `backend=local` 时生效：读取 `人设/soul.md` 和 `人设/agent.md` 拼入 system prompt |
 | `group_empty_at_replies` | （5 条） | 仅 @、无正文/图/引用时随机发送的文案；逗号分隔 |
 
-#### `[local]` — 本地模型（LM Studio / Ollama / vLLM）
+#### `[local]` — 本地模型（LM Studio）
 
 | 项 | 说明 |
 |----|------|
-| `base_url` | 服务根地址（如 `http://127.0.0.1:1234/v1`） |
+| `base_url` | 服务根地址，程序自动规范化为 `.../api/v1/chat` |
 | `api_key` | API 密钥，多数本地服务可填占位值 |
 | `model` | 模型 ID，须与服务端注册的名称一致 |
-| `supports_vision` | `true`/`false`：是否启用图片理解（需模型支持多模态） |
-| `system_prompt` | 系统提示词（人设） |
+| `system_prompt` | system 人设 |
 | `timeout_seconds` | 请求超时秒数（默认 120） |
 
-> **图片理解**：发送顺序为文字在前、图片在后（适配 LM Studio / Qwen Jinja 模板）。多轮中仅最后一条 user 消息保留图片，早期带图轮次会压成纯文字。单条最多 **6 张** 图片。
+> **图片理解**：发送顺序为文字在前、图片在后（适配 LM Studio / Qwen Jinja 模板）。单条最多 **6 张** 图片。
 
 #### `[openclaw]` — OpenClaw Gateway
 
@@ -204,9 +199,9 @@ E:\aibot\models\Qwen3-TTS-12Hz-1.7B-Base\
 
 | 场景 | 指令 | 效果 |
 |------|------|------|
-| 私聊 | `/清空` 或 `/clear` | 清空自己的私聊多轮桶 |
-| 群内（需 @） | `/清空` 或 `/clear` | 清空自己在该群的多轮桶 |
-| 私聊 | `/清空全部记忆` | 仅 `memory_clear_master_qq` 中的 QQ 可用：清空所有记忆桶 |
+| 私聊 | `/清空` 或 `/clear` | 清空自己的私聊 session |
+| 群内（需 @） | `/清空` 或 `/clear` | 清空自己在该群的 session |
+| 私聊 | `/清空全部记忆` | 仅 `memory_clear_master_qq` 中的 QQ 可用：清空所有用户的 session |
 
 ### 戳一戳
 
@@ -228,7 +223,7 @@ taskkill /PID <PID> /F
 
 - [ ] 群号已写入 `group_whitelist.ini`
 - [ ] 确认 @ 的是**本机器人**，且 @ 后有文字
-- [ ] 本地模型：确认 LM Studio/Ollama 服务已启动
+- [ ] 本地模型：确认 LM Studio 服务已启动
 - [ ] 日志有 `OneBot V11 … connected`
 
 ### NapCat 连接失败
@@ -269,11 +264,11 @@ aibot/
 │   ├── __init__.py                # 消息处理器（私聊/群聊/戳一戳）
 │   ├── llm_reply.py               # LLM 调用（local / openclaw 双后端）
 │   ├── llm_ini.py                 # 读取 llm_config.ini
-│   ├── chat_history.py            # 多轮对话内存管理
+│   ├── chat_history.py            # LM Studio previous_response_id 存储与 session 清空
 │   ├── whitelist.py               # 群白名单加载
 │   ├── message_image.py           # 图片解析与压缩
 │   ├── quoted_context.py          # 引用消息上下文
-│   ├── reply_error_echo_guard.py # 拦截 API 错误复述
+│   ├── reply_error_echo_guard.py  # 拦截 API 错误复述
 │   └── tts.py                     # Qwen3-TTS 语音合成
 ├── 人设/
 │   ├── soul.md                    # 身份人设

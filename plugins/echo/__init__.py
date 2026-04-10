@@ -1,12 +1,16 @@
 """NapCat ↔ NoneBot；群聊白名单 + @ / 引用机器人；回复由 llm_config.ini 选择 OpenClaw 或本地模型。"""
 
+import base64
 import logging
 import random
+from io import BytesIO
 
+import httpx
 from nonebot import on_message, on_notice
 from nonebot.adapters.onebot.v11 import (
     Bot,
     GroupMessageEvent,
+    Message,
     MessageEvent,
     MessageSegment,
     PokeNotifyEvent,
@@ -19,13 +23,7 @@ from .llm_ini import (
     get_backend,
     get_group_empty_at_replies,
     memory_clear_master_qq_ids,
-    model_supports_vision,
     openclaw_private_allowed,
-)
-from .message_image import (
-    merge_vision_image_uris,
-    message_has_image,
-    resolve_images_from_message,
 )
 from .llm_reply import reply_with_configured_llm
 from .quoted_context import build_user_prompt_with_quote, quoted_reply_to_text_prefix
@@ -33,6 +31,99 @@ from .tts import cleanup_temp_file, synthesize_speech, tts_is_available
 from .whitelist import load_group_ids
 
 logger = logging.getLogger(__name__)
+
+MAX_IMAGES_PER_MESSAGE = 6
+
+
+def _message_has_image(event: MessageEvent) -> bool:
+    return any(seg.type == "image" for seg in event.message)
+
+
+async def _url_to_base64_data_uri(url: str) -> str | None:
+    """下载 HTTP 图片并转为 base64 data URI。"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+        raw = r.content
+    except Exception as e:
+        logger.warning("download image failed: %s", e)
+        return None
+    b64 = base64.b64encode(raw).decode()
+    # 简单猜测 MIME 类型
+    if raw[:3] == b"\x89PNG":
+        mime = "image/png"
+    elif raw[:2] == b"\xff\xd8":
+        mime = "image/jpeg"
+    elif raw[:4] == b"GIF8":
+        mime = "image/gif"
+    elif raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        mime = "image/webp"
+    else:
+        mime = "image/jpeg"
+    return f"data:{mime};base64,{b64}"
+
+
+async def _resolve_image_uris(bot: Bot, message: Message) -> list[str]:
+    """从消息中提取图片，HTTP URL 下载后转 base64，本地 file ID 调用 API 解析，最多 6 张。"""
+    uris: list[str] = []
+    for seg in message:
+        if seg.type != "image":
+            continue
+        if len(uris) >= MAX_IMAGES_PER_MESSAGE:
+            break
+        data = seg.data or {}
+        url = (data.get("url") or "").strip()
+        file_val = (data.get("file") or "").strip()
+
+        # 直接的 HTTP URL → 下载转 base64
+        if url.startswith(("http://", "https://")):
+            uri = await _url_to_base64_data_uri(url)
+            if uri:
+                uris.append(uri)
+            continue
+
+        # file 字段是 HTTP URL → 同样下载
+        if file_val.startswith(("http://", "https://")):
+            uri = await _url_to_base64_data_uri(file_val)
+            if uri:
+                uris.append(uri)
+            continue
+
+        # file 字段是 base64:// → 直接用
+        if file_val.startswith("base64://"):
+            uris.append(f"data:image/png;base64,{file_val[len('base64://'):]}")
+            continue
+
+        # file ID → 调用 API 获取真实 URL / base64
+        if file_val:
+            try:
+                ret = await bot.call_api("get_image", file=file_val)
+            except Exception as e:
+                logger.warning("get_image failed file=%s: %s", file_val[:80], e)
+                ret = None
+            if isinstance(ret, dict):
+                u = (ret.get("url") or "").strip()
+                b64 = (ret.get("base64") or ret.get("data") or "").strip()
+                if u.startswith(("http://", "https://")):
+                    uri = await _url_to_base64_data_uri(u)
+                    if uri:
+                        uris.append(uri)
+                elif b64:
+                    uris.append(f"data:image/png;base64,{b64}")
+
+    return uris
+
+
+def _merge_image_uris(quoted: list[str], current: list[str]) -> list[str]:
+    """合并引用消息和本条消息的图片 URL，总数不超过 6 张。"""
+    out: list[str] = list(quoted)
+    for u in current:
+        if len(out) >= MAX_IMAGES_PER_MESSAGE:
+            break
+        if u:
+            out.append(u)
+    return out
 
 
 def _private_only() -> Rule:
@@ -125,20 +216,20 @@ _priv = on_message(rule=_private_only(), priority=10, block=False)
 @_priv.handle()
 async def _(bot: Bot, event: PrivateMessageEvent) -> None:
     text_plain = event.get_plaintext().strip()
-    has_img = message_has_image(event)
+    has_img = _message_has_image(event)
     rep = getattr(event, "reply", None)
     if not text_plain and not has_img and rep is None:
         return
     if text_plain.lower() in ("/清空", "/clear"):
         clear_session(history_key("private", str(event.user_id), None))
-        await bot.send(event, "已清空你的私聊对话记忆。")
+        await bot.send(event, "已清空你的私聊 session。")
         return
     if text_plain == "/清空全部记忆":
         masters = memory_clear_master_qq_ids()
         uid = str(event.user_id)
         if masters and uid in masters:
             clear_all_sessions()
-            await bot.send(event, "已清空所有会话的多轮记忆（内存）。")
+            await bot.send(event, "已清空所有用户的 LLM session。")
         elif masters:
             logger.warning(
                 "Rejected /清空全部记忆: user_id=%s not in memory_clear_master_qq",
@@ -147,25 +238,20 @@ async def _(bot: Bot, event: PrivateMessageEvent) -> None:
         return
     prefix = quoted_reply_to_text_prefix(rep)
     quoted_uris: list[str] = []
-    if rep is not None and model_supports_vision() and get_backend() == "local":
-        quoted_uris = await resolve_images_from_message(bot, rep.message)
+    if rep is not None and get_backend() == "local":
+        quoted_uris = await _resolve_image_uris(bot, rep.message)
     curr_uris: list[str] = []
-    if has_img and model_supports_vision() and get_backend() == "local":
-        curr_uris = await resolve_images_from_message(bot, event.message)
-    merged_uris = merge_vision_image_uris(quoted_uris, curr_uris)
+    if has_img and get_backend() == "local":
+        curr_uris = await _resolve_image_uris(bot, event.message)
+    merged_uris = _merge_image_uris(quoted_uris, curr_uris)
     full_text = build_user_prompt_with_quote(prefix, text_plain)
 
-    if has_img and not model_supports_vision() and not text_plain.strip():
+    if has_img and get_backend() == "local" and not curr_uris and not quoted_uris and not text_plain.strip():
+        logger.warning(
+            "Private message: vision but no image URIs resolved (user_id=%s)",
+            event.user_id,
+        )
         return
-    if has_img and get_backend() != "local" and not text_plain.strip():
-        return
-    if has_img and model_supports_vision() and get_backend() == "local":
-        if not curr_uris and not quoted_uris and not text_plain.strip():
-            logger.warning(
-                "Private message: vision enabled but no image URIs resolved (user_id=%s)",
-                event.user_id,
-            )
-            return
     if len(full_text) > 8000:
         logger.warning(
             "Private message too long: %d chars (user_id=%s)",
@@ -209,7 +295,7 @@ async def _(bot: Bot, event: GroupMessageEvent) -> None:
     if not _is_addressed_to_bot(bot, event):
         return
     text_plain = event.get_plaintext().strip()
-    has_img = message_has_image(event)
+    has_img = _message_has_image(event)
     rep = getattr(event, "reply", None)
     if _group_empty_prompt_no_text_no_image(bot, event, text_plain, has_img):
         lines = get_group_empty_at_replies()
@@ -224,31 +310,26 @@ async def _(bot: Bot, event: GroupMessageEvent) -> None:
         clear_session(
             history_key("group", str(event.user_id), str(event.group_id)),
         )
-        await bot.send(event, MessageSegment.reply(event.message_id) + "已清空你在本群的对话记忆。")
+        await bot.send(event, MessageSegment.reply(event.message_id) + "已清空你在本群的 session。")
         return
     prefix = quoted_reply_to_text_prefix(rep)
     quoted_uris: list[str] = []
-    if rep is not None and model_supports_vision() and get_backend() == "local":
-        quoted_uris = await resolve_images_from_message(bot, rep.message)
+    if rep is not None and get_backend() == "local":
+        quoted_uris = await _resolve_image_uris(bot, rep.message)
     curr_uris: list[str] = []
-    if has_img and model_supports_vision() and get_backend() == "local":
-        curr_uris = await resolve_images_from_message(bot, event.message)
-    merged_uris = merge_vision_image_uris(quoted_uris, curr_uris)
+    if has_img and get_backend() == "local":
+        curr_uris = await _resolve_image_uris(bot, event.message)
+    merged_uris = _merge_image_uris(quoted_uris, curr_uris)
     full_text = build_user_prompt_with_quote(prefix, text_plain)
 
-    if has_img and not model_supports_vision() and not text_plain.strip():
+    if has_img and get_backend() == "local" and not curr_uris and not quoted_uris and not text_plain.strip():
+        logger.warning(
+            "Group message: vision but no image URIs resolved "
+            "(group_id=%s user_id=%s)",
+            event.group_id,
+            event.user_id,
+        )
         return
-    if has_img and get_backend() != "local" and not text_plain.strip():
-        return
-    if has_img and model_supports_vision() and get_backend() == "local":
-        if not curr_uris and not quoted_uris and not text_plain.strip():
-            logger.warning(
-                "Group message: vision enabled but no image URIs resolved "
-                "(group_id=%s user_id=%s)",
-                event.group_id,
-                event.user_id,
-            )
-            return
     if len(full_text) > 8000:
         logger.warning(
             "Group message too long: %d chars (group_id=%s user_id=%s)",
