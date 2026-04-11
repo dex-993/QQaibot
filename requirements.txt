@@ -12,3 +12,4 @@ qwen-tts
 soundfile
 numpy
 scipy
+platformdirs
