@@ -18,10 +18,11 @@ from nonebot.adapters.onebot.v11 import (
 )
 from nonebot.rule import Rule
 
-from .chat_history import clear_all_sessions, clear_session, history_key
+from .chat_history import clear_all_sessions, clear_session, clear_session_by_scope, hermes_history_key, history_key
 from .llm_ini import (
     get_backend,
     get_group_empty_at_replies,
+    hermes_private_allowed,
     memory_clear_master_qq_ids,
     openclaw_private_allowed,
 )
@@ -221,7 +222,7 @@ async def _(bot: Bot, event: PrivateMessageEvent) -> None:
     if not text_plain and not has_img and rep is None:
         return
     if text_plain.lower() in ("/清空", "/clear"):
-        clear_session(history_key("private", str(event.user_id), None))
+        clear_session_by_scope("private", str(event.user_id), None)
         await bot.send(event, "已清空你的私聊 session。")
         return
     if text_plain == "/清空全部记忆":
@@ -260,6 +261,8 @@ async def _(bot: Bot, event: PrivateMessageEvent) -> None:
         )
         return
     if get_backend() == "openclaw" and not openclaw_private_allowed(str(event.user_id)):
+        return
+    if get_backend() == "hermes" and not hermes_private_allowed(str(event.user_id)):
         return
 
     reply = await reply_with_configured_llm(
@@ -307,9 +310,7 @@ async def _(bot: Bot, event: GroupMessageEvent) -> None:
         await bot.send(event, MessageSegment.reply(event.message_id) + msg)
         return
     if text_plain.lower() in ("/清空", "/clear"):
-        clear_session(
-            history_key("group", str(event.user_id), str(event.group_id)),
-        )
+        clear_session_by_scope("group", str(event.user_id), str(event.group_id))
         await bot.send(event, MessageSegment.reply(event.message_id) + "已清空你在本群的 session。")
         return
     prefix = quoted_reply_to_text_prefix(rep)

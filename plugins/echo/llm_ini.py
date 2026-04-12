@@ -30,7 +30,7 @@ def get_backend() -> str:
     if not cfg.has_section("llm"):
         return "local"
     v = (cfg.get("llm", "backend", fallback="local") or "local").strip().lower()
-    if v in ("openclaw", "local"):
+    if v in ("openclaw", "local", "hermes"):
         return v
     return "local"
 
@@ -56,6 +56,15 @@ def openclaw_private_allowed(user_id: str) -> bool:
     if not allowed:
         return False
     return str(user_id).strip() in allowed
+
+
+def hermes_private_allowed(user_id: str) -> bool:
+    """Hermes 私聊白名单：仅这些 QQ 号会请求 Hermes。逗号分隔，支持中文逗号。"""
+    raw = (section_dict("hermes").get("private_allow_qq") or "").strip()
+    if not raw:
+        return True  # 留空则不限制
+    normalized = raw.replace("，", ",")
+    return str(user_id).strip() in {x.strip() for x in normalized.split(",") if x.strip()}
 
 
 def memory_clear_master_qq_ids() -> set[str]:

@@ -48,14 +48,9 @@ nonebot.load_plugins("plugins")
 
 @driver.on_startup
 def _check_tts():
-    from plugins.echo.llm_ini import get_backend
-    backend = get_backend()
-    if backend == "local":
-        from plugins.echo.tts import _validate_voice_ref
-        ok, msg = _validate_voice_ref()
-        logger.info("[TTS] %s", msg)
-    else:
-        logger.info("[TTS] skipped (backend=%s, TTS only works with backend=local)", backend)
+    from plugins.echo.tts import _validate_voice_ref
+    ok, msg = _validate_voice_ref()
+    logger.info("[TTS] %s", msg)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ import httpx
 
 import openclaw_memory
 
-from .chat_history import ChatScope, _lm_response_ids
+from .chat_history import ChatScope, _hermes_session_ids, _lm_response_ids, hermes_history_key
 from .llm_ini import get_backend, section_dict
 from .reply_error_echo_guard import assistant_text_looks_like_api_error_echo
 
@@ -324,6 +324,89 @@ async def _call_local(
     return True, text
 
 
+def _hermes_flatten_user_content(content: object) -> str:
+    """Hermes 仅走文本：多模态 user content 只取 text 段。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts: list[str] = []
+        for x in content:
+            if isinstance(x, dict) and x.get("type") == "text":
+                texts.append(str(x.get("text", "")))
+        return "\n".join(texts) or "（本条含图片，暂不按图理解）"
+    return ""
+
+
+async def _call_hermes(
+    messages: list[dict[str, Any]],
+    session_key: str,
+    timeout: float,
+) -> tuple[bool, str]:
+    """调用 Hermes Agent 的 OpenAI 兼容 /v1/chat/completions 接口。"""
+    hm = section_dict("hermes")
+    base_url = (hm.get("base_url") or "http://192.168.115.128:8642").strip().rstrip("/")
+    api_key = (hm.get("api_key") or "").strip()
+    model = (hm.get("model") or "").strip()
+    url = f"{base_url}/v1/chat/completions"
+
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # X-Hermes-Session-Id：多轮上下文由服务端维护
+    session_id = _hermes_session_ids.get(session_key, "")
+    if session_id:
+        headers["X-Hermes-Session-Id"] = session_id
+
+    body: dict[str, Any] = {"stream": False}
+    if model:
+        body["model"] = model
+    body["messages"] = messages
+
+    logger.info("[Hermes] POST %s session_id=%s", url, session_id or "(new)")
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(url, headers=headers, json=body)
+    except Exception:
+        logger.exception("Hermes HTTP request failed")
+        return False, ""
+
+    if resp.status_code != 200:
+        logger.warning("Hermes HTTP %s: %s", resp.status_code, resp.text[:500])
+        return False, ""
+
+    try:
+        data = resp.json()
+    except Exception:
+        logger.warning("Hermes response not JSON: %s", resp.text[:500])
+        return False, ""
+
+    # 提取 assistant 回复
+    text = ""
+    choices = data.get("choices") if isinstance(data, dict) else []
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        msg = first.get("message") if isinstance(first, dict) else {}
+        if isinstance(msg, dict):
+            text = (msg.get("content") or "").strip()
+
+    if not text:
+        logger.warning("Hermes returned empty content: %s", str(data)[:500])
+        return False, ""
+
+    if assistant_text_looks_like_api_error_echo(text):
+        logger.warning("Hermes reply looks like API error echo (suppressed): %s", text[:500])
+        return False, ""
+
+    # 保存 session id 供下次请求
+    new_session = resp.headers.get("X-Hermes-Session-Id") or ""
+    if new_session:
+        _hermes_session_ids[session_key] = new_session
+
+    return True, text
+
+
 def _openclaw_flatten_user_content(content: object) -> str:
     """OpenClaw 仅走文本：多模态 user 只取 text 段。"""
     if isinstance(content, str):
@@ -367,7 +450,7 @@ async def reply_with_configured_llm(
     image_data_uris: list[str] | None = None,
     sender_label: str = "",
 ) -> str:
-    """按 backend 路由，多轮上下文由各后端自行维护（OpenClaw=session key，LM Studio=response_id）。"""
+    """按 backend 路由，多轮上下文由各后端自行维护（OpenClaw/Hermes=session key，LM Studio=response_id）。"""
 
     uris = [u for u in (image_data_uris or []) if u]
     backend = get_backend()
@@ -409,6 +492,22 @@ async def reply_with_configured_llm(
             instructions=instr,
             timeout=timeout,
         )
+    elif backend == "hermes":
+        hm = section_dict("hermes")
+        base_system = (hm.get("system_prompt") or "你是一个友好的聊天助手。").strip()
+        if chat_scope == "group":
+            group_suffix = (hm.get("group_system_suffix") or "").strip()
+            if group_suffix:
+                base_system = (base_system + "\n\n" + group_suffix) if base_system else group_suffix
+        timeout = float(hm.get("timeout_seconds") or "120")
+
+        # 提取用户文本（图片暂不支持）
+        user_raw = _hermes_flatten_user_content(
+            _prepend_sender_label(user_text, sender_label) if sender_label else user_text
+        )
+        messages: list[dict[str, str]] = [{"role": "user", "content": user_raw}]
+        hermes_key = hermes_history_key(chat_scope, user_id, group_id)
+        ok, reply = await _call_hermes(messages, session_key=hermes_key, timeout=timeout)
     else:
         loc = section_dict("local")
         base_system = (loc.get("system_prompt") or "你是一个友好的聊天助手。").strip()
