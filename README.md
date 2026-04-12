@@ -1,15 +1,15 @@
 # aibot - QQ 机器人
 
-基于 **NoneBot2** + **NapCatQQ（OneBot v11）** 的 QQ 机器人，支持本地大模型和 OpenClaw Gateway 两种后端，提供私聊/群聊、多轮对话（服务端维护）、图片理解和语音回复功能。
+基于 **NoneBot2** + **NapCatQQ（OneBot v11）** 的 QQ 机器人，支持本地大模型、OpenClaw Gateway 和 Hermes Agent 三种后端，提供私聊/群聊、多轮对话（服务端维护）、图片理解和语音回复功能。
 
 ---
 
 ## 功能特性
 
-- **双后端支持**：本地 LM Studio 或 OpenClaw Gateway
+- **三后端支持**：本地 LM Studio、OpenClaw Gateway 或 Hermes Agent（任选其一）
 - **私聊 & 群聊**：私聊直接调用模型；群聊仅白名单群内 @ 机器人时响应
-- **多轮对话**：多轮上下文由各后端自行维护（OpenClaw=session key，LM Studio=previous_response_id）
-- **图片理解**：发送图片给模型进行多模态理解（需 `backend=local` + 模型支持视觉）
+- **多轮对话**：多轮上下文由各后端自行维护（OpenClaw/Hermes=session key，LM Studio=previous_response_id）
+- **图片理解**：发送图片给模型进行多模态理解（需 `backend=local` + 模型支持视觉；Hermes 暂不支持）
 - **语音回复（TTS）**：Qwen3-TTS 将文字合成为语音，支持语音克隆；超时/失败自动降级为文字
 - **引用上下文**：引用他人消息时，将发送者和原文一并提交给模型
 - **人设记忆**：启动时自动加载 `人设/soul.md` 和 `人设/agent.md` 拼入 system prompt
@@ -20,7 +20,7 @@
 ## 架构
 
 ```
-QQ 客户端 ←→ NapCatQQ ←→ NoneBot2（aibot）←→ 本地模型 / OpenClaw Gateway
+QQ 客户端 ←→ NapCatQQ ←→ NoneBot2（aibot）←→ 本地模型 / OpenClaw Gateway / Hermes Agent
                     ↑
               OneBot v11 正向 WebSocket
 ```
@@ -31,9 +31,10 @@ QQ 客户端 ←→ NapCatQQ ←→ NoneBot2（aibot）←→ 本地模型 / Ope
 
 - **Python** 3.10+
 - **NapCatQQ**：已安装运行，开启 **OneBot 11 正向 WebSocket**
-- **大模型服务**（二选一）：
+- **大模型服务**（三选一）：
   - **local**：本地 LM Studio 服务
   - **openclaw**：OpenClaw Gateway 已启用 `POST /v1/responses`，见 [OpenResponses API 文档](https://docs.openclaw.ai/zh-CN/gateway/openresponses-http-api)
+  - **hermes**：Hermes Agent 已启用 OpenAI 兼容 API（`API_SERVER_ENABLED=true`），见 [Hermes Agent](https://github.com/nousresearch/hermes-agent)
 - **TTS（可选）**：[Qwen3-TTS-12Hz-1.7B-Base](https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base)（约 3.6 GB），Tokenizer 若与模型同目录则自动找到，无需单独配置
 
 ---
@@ -70,7 +71,7 @@ copy group_whitelist.example.ini group_whitelist.ini
 
 ```
 第一步：启动 NapCat（确保 QQ 已登录，OneBot 正向 WebSocket 已开启）
-第二步：启动大模型服务（若用 backend=local）
+第二步：启动大模型服务（若用 backend=local / backend=hermes）
 第三步：运行机器人
 ```
 
@@ -110,7 +111,7 @@ python bot.py
 
 | 项 | 默认值 | 说明 |
 |----|--------|------|
-| `backend` | `local` | `local`（LM Studio）或 `openclaw`（OpenClaw Gateway） |
+| `backend` | `local` | `local`（LM Studio）、`openclaw`（OpenClaw Gateway）或 `hermes`（Hermes Agent） |
 | `龙虾记忆` | `true` | 仅 `backend=local` 时生效：读取 `人设/soul.md` 和 `人设/agent.md` 拼入 system prompt |
 | `group_empty_at_replies` | （5 条） | 仅 @、无正文/图/引用时随机发送的文案；逗号分隔 |
 
@@ -124,7 +125,7 @@ python bot.py
 | `system_prompt` | system 人设 |
 | `timeout_seconds` | 请求超时秒数（默认 120） |
 
-> **图片理解**：发送顺序为文字在前、图片在后（适配 LM Studio / Qwen Jinja 模板）。单条最多 **6 张** 图片。
+> **图片理解**：发送顺序为文字在前、图片在后（适配 LM Studio / Qwen Jinja 模板）。单条最多 **6 张** 图片。（仅 `backend=local` 支持）
 
 #### `[openclaw]` — OpenClaw Gateway
 
@@ -144,6 +145,20 @@ python bot.py
 > "http": { "endpoints": { "responses": { "enabled": true } } }
 > ```
 > 保存后重启 OpenClaw Gateway。
+
+#### `[hermes]` — Hermes Agent
+
+| 项 | 说明 |
+|----|------|
+| `base_url` | Hermes API 根地址（如 `http://192.168.115.128:8642`）；程序自动拼 `/v1/chat/completions` |
+| `api_key` | 与 Hermes `API_SERVER_KEY` 一致的 Bearer Token；勿泄露 |
+| `model` | 模型名称（见 `GET /v1/models`）；留空使用默认 |
+| `system_prompt` | system 人设；留空则使用内置默认 |
+| `group_system_suffix` | 群聊时在 `system_prompt` 后追加的内容；描述群聊中的身份与行为规范 |
+| `private_allow_qq` | `backend=hermes` 时允许私聊的 QQ 白名单（逗号分隔）；留空则不限制；群聊不受限 |
+| `timeout_seconds` | HTTP 请求超时秒数（默认 120） |
+
+> **多轮会话**：Hermes 通过 `X-Hermes-Session-Id` header 维护多轮上下文。群聊每群一个全员共享的 session，私聊每用户一个 session，与 OpenClaw 行为一致。
 
 #### `[tts]` — 语音合成
 
@@ -186,6 +201,7 @@ models/Qwen3-TTS-12Hz-1.7B-Base/
 
 - 直接发送文字即可调用模型（过长会提示缩短）
 - **`backend=openclaw`**：仅 `private_allow_qq` 名单内的 QQ 会收到回复；其余静默
+- **`backend=hermes`**：仅 `private_allow_qq` 名单内的 QQ 会收到回复；其余静默；留空则不限制
 - **`backend=local`**：无 QQ 白名单限制
 
 ### 群聊
@@ -198,9 +214,9 @@ models/Qwen3-TTS-12Hz-1.7B-Base/
 
 | 场景 | 指令 | 效果 |
 |------|------|------|
-| 私聊 | `/清空` 或 `/clear` | 清空自己的私聊 session（仅 `backend=local` 时有效） |
-| 群内（需 @） | `/清空` 或 `/clear` | 清空自己在该群的 session（仅 `backend=local` 时有效） |
-| 私聊 | `/清空全部记忆` | 仅 `memory_clear_master_qq` 中的 QQ 可用：清空所有用户的 session（仅 `backend=local` 时有效） |
+| 私聊 | `/清空` 或 `/clear` | 清空自己的私聊 session |
+| 群内（需 @） | `/清空` 或 `/clear` | 清空自己在该群的 session（群聊 session 全员共享，/清空 一次即重置全群上下文） |
+| 私聊 | `/清空全部记忆` | 仅 `memory_clear_master_qq` 中的 QQ 可用：清空所有用户的 session |
 
 ### 戳一戳
 
