@@ -1,4 +1,5 @@
 # aibot - QQ 机器人
+这个项目是vibe coding的，欢迎魔改，随便用，我也不懂什么开源协议，你们想怎么弄就怎么用。感谢napcat团队和千问团队
 
 基于 **NoneBot2** + **NapCatQQ（OneBot v11）** 的 QQ 机器人，支持本地大模型、OpenClaw Gateway 和 Hermes Agent 三种后端，提供私聊/群聊、多轮对话（服务端维护）、图片理解和语音回复功能。
 
